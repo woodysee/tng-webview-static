@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TnG bridge check (no CSP)</title>
+<style>
+  body { font: 14px/1.4 monospace; margin: 12px; color: #111; background: #fff; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  #log div { padding: 2px 0; border-bottom: 1px solid #eee; word-break: break-all; }
+  .ok { color: #060; } .bad { color: #a00; } .info { color: #333; } .console { color: #536; }
+</style>
+</head>
+<body>
+<h1>TnG bridge check (no CSP)</h1>
+<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 10 seconds, then screenshot the whole list and send it back.</p>
+<div id="log"></div>
+<script>
+(function () {
+  var t0 = performance.now();
+  var logEl = document.getElementById('log');
+  function log(kind, text) {
+    var row = document.createElement('div');
+    row.className = kind;
+    row.textContent = '[' + Math.round(performance.now() - t0) + 'ms] ' + text;
+    logEl.appendChild(row);
+  }
+  function describe(value) {
+    try { return typeof value === 'string' ? value : JSON.stringify(value); } catch (e) { return String(value); }
+  }
+
+  // The container's own loader logs lines such as "jsapi load start" to the console. Mirroring the console here puts those lines on screen.
+  ['log', 'info', 'warn', 'error'].forEach(function (level) {
+    var original = console[level];
+    console[level] = function () {
+      var parts = Array.prototype.map.call(arguments, describe);
+      log('console', 'console.' + level + ': ' + parts.join(' '));
+      if (original) { original.apply(console, arguments); }
+    };
+  });
+  window.addEventListener('error', function (e) {
+    log('bad', 'script error: ' + e.message + ' at ' + (e.filename || '(inline)') + ':' + e.lineno);
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    log('bad', 'unhandled rejection: ' + describe(e.reason && e.reason.message ? e.reason.message : e.reason));
+  });
+
+  log('info', 'page: ' + location.href);
+  log('info', 'referrer: ' + (document.referrer || '(none)'));
+  log('info', 'userAgent: ' + navigator.userAgent);
+  log('info', 'readyState at script start: ' + document.readyState);
+  log('info', 'top-level document: ' + (window.top === window.self));
+  log('info', 'typeof window.tngdJSBridge at script start: ' + typeof window.tngdJSBridge);
+  log('info', 'typeof window.AlipayJSBridge at script start: ' + typeof window.AlipayJSBridge);
+  log('info', 'typeof my at script start: ' + typeof window.my + ', my.getAuthCode: ' + (window.my ? typeof window.my.getAuthCode : '(no my)') + ', my.postMessage: ' + (window.my ? typeof window.my.postMessage : '(no my)'));
+
+  // Every script element and iframe the container inserts is listed with its src, its nonce and its size.
+  var observer = new MutationObserver(function (mutations) {
+    mutations.forEach(function (m) {
+      Array.prototype.forEach.call(m.addedNodes, function (node) {
+        if (node.tagName === 'SCRIPT') {
+          log('info', 'script inserted: src=' + (node.src || '(inline, ' + (node.textContent || '').length + ' chars)') + ' nonce=' + (node.nonce || node.getAttribute('nonce') || '(none)'));
+        }
+        if (node.tagName === 'IFRAME') {
+          log('info', 'iframe inserted: src=' + node.src);
+        }
+      });
+    });
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  // A refused script or connection reports here, with or without a devtools console.
+  document.addEventListener('securitypolicyviolation', function (e) {
+    log('bad', 'CSP violation: directive=' + e.violatedDirective + ' blocked=' + e.blockedURI + ' disposition=' + e.disposition + ' sample=' + (e.sample || '(none)'));
+  });
+
+  var received = false;
+  var calledTngdBridge = false;
+  var calledMy = false;
+
+  // The call the production page makes, through the object the 2024 integration named.
+  function callTngdBridge(source) {
+    if (calledTngdBridge) { return; }
+    calledTngdBridge = true;
+    log('ok', 'calling tngdJSBridge.call getAuthCode via ' + source + ', typeof bridge=' + typeof window.tngdJSBridge);
+    if (!window.tngdJSBridge) {
+      log('bad', 'no window.tngdJSBridge object at call time');
+      return;
+    }
+    window.tngdJSBridge.call(
+      'getAuthCode',
+      {
+        scopes: ['BASE_USER_INFO'],
+        clientId: 'dummy-client-id',
+        redirectUrl: 'https://www.google.com',
+        extRequestId: 'check-' + Date.now(),
+        grantType: 'AUTHORIZATION_CODE'
+      },
+      function (result) {
+        log('ok', 'tngdJSBridge getAuthCode answered: ' + describe(result));
+      }
+    );
+  }
+
+  // The call the public mini program portal documents for an H5 page (the JSAPI web-bridge).
+  function callMyGetAuthCode(source) {
+    if (calledMy) { return; }
+    if (!window.my || typeof window.my.getAuthCode !== 'function') {
+      log('bad', 'my.getAuthCode is not a function at ' + source + ' (typeof my=' + typeof window.my + ')');
+      return;
+    }
+    calledMy = true;
+    log('ok', 'calling my.getAuthCode via ' + source);
+    window.my.getAuthCode({
+      scopes: ['auth_base'],
+      success: function (result) { log('ok', 'my.getAuthCode success: ' + describe(result)); },
+      fail: function (err) { log('bad', 'my.getAuthCode fail: ' + describe(err)); }
+    });
+  }
+
+  document.addEventListener('tngdJSBridgeReady', function () {
+    received = true;
+    log('ok', 'tngdJSBridgeReady fired on document, readyState=' + document.readyState);
+    callTngdBridge('the ready event');
+    callMyGetAuthCode('the ready event');
+  });
+  document.addEventListener('AlipayJSBridgeReady', function () {
+    log('info', 'AlipayJSBridgeReady fired on document (the Alipay name, not the TnG one)');
+    callMyGetAuthCode('the Alipay ready event');
+  });
+
+  if (window.tngdJSBridge) {
+    log('ok', 'bridge object already present at script start');
+    callTngdBridge('the mount-time check');
+    callMyGetAuthCode('the mount-time check');
+  }
+
+  [1000, 3000, 10000].forEach(function (ms) {
+    setTimeout(function () {
+      log(received ? 'info' : 'bad', ms + 'ms check: event received=' + received + ' typeof tngdJSBridge=' + typeof window.tngdJSBridge + ' typeof my=' + typeof window.my + ' scripts in document=' + document.scripts.length);
+      if (ms === 3000 && !received) {
+        callMyGetAuthCode('the 3 second check, without any ready event');
+      }
+    }, ms);
+  });
+})();
+</script>
+</body>
+</html>
