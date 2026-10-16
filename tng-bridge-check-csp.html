@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <!--
   The same check page, under the script policy the production miniprogram route sends.
   The source list is copied from the production header captured on 2026-10-15,
@@ -11,7 +12,6 @@
   container inserts without this nonce is refused and reported in the list.
 -->
 <meta http-equiv="Content-Security-Policy" content="script-src 'unsafe-inline' https: 'unsafe-eval' 'strict-dynamic' 'report-sample' 'self' *.px-cloud.net *.px-cdn.net client.perimeterx.net https://maps.googleapis.com https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/ *.fintech.deliveryhero.com https://micro-assets.foodora.com 'nonce-probe2026101500000000'">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TnG bridge check (production CSP)</title>
 <style>
   body { font: 14px/1.4 monospace; margin: 12px; color: #111; background: #fff; }
@@ -22,7 +22,7 @@
 </head>
 <body>
 <h1>TnG bridge check (production CSP)</h1>
-<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then screenshot the whole list and send it back. Query parameters: clientId, redirectUrl, scopes (comma separated), and mode (immediate, afterFinish or both).</p>
+<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then screenshot the whole list and send it back. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none).</p>
 <div id="log"></div>
 <script nonce="probe2026101500000000">
 (function () {
@@ -43,7 +43,82 @@
     clientId: query.get('clientId') || 'dummy-client-id',
     redirectUrl: query.get('redirectUrl') || 'https://www.google.com',
     scopes: (query.get('scopes') || 'BASE_USER_INFO').split(','),
-    mode: query.get('mode') || 'both'
+    mode: query.get('mode') || 'both',
+    extraActions: (query.get('extraActions') || 'getSystemInfo').split(',').filter(function (name) { return name && name !== 'none'; })
+  };
+
+  // A deep description that survives cycles, host objects and functions, so an event object or the bridge object prints whole.
+  function describeDeep(value, depth, seen) {
+    depth = depth || 0; seen = seen || [];
+    if (value === null || value === undefined) { return String(value); }
+    var type = typeof value;
+    if (type === 'function') { return 'function(' + value.length + ')'; }
+    if (type !== 'object') { return type === 'string' ? JSON.stringify(value) : String(value); }
+    if (seen.indexOf(value) !== -1) { return '[cycle]'; }
+    if (depth > 3) { return '[depth]'; }
+    seen.push(value);
+    if (value instanceof Node) { return '[' + value.nodeName + ']'; }
+    if (value === window) { return '[window]'; }
+    var names = [];
+    try { names = Object.getOwnPropertyNames(value); } catch (e) { return '[unreadable: ' + e.message + ']'; }
+    var out = {};
+    names.forEach(function (name) {
+      try { out[name] = describeDeep(value[name], depth + 1, seen); } catch (e) { out[name] = '[throws: ' + e.message + ']'; }
+    });
+    var proto = Object.getPrototypeOf(value);
+    var protoName = proto && proto.constructor && proto.constructor.name;
+    if (protoName && protoName !== 'Object') { out.__proto__name = protoName; }
+    try { return JSON.stringify(out); } catch (e) { return String(out); }
+  }
+
+  // The names on window at script start, so every global the container adds later is listed by name.
+  var windowNamesAtStart = {};
+  try { Object.getOwnPropertyNames(window).forEach(function (name) { windowNamesAtStart[name] = true; }); } catch (e) {}
+  var reportedNewNames = {};
+  function logNewWindowNames(when) {
+    var added = [];
+    try {
+      Object.getOwnPropertyNames(window).forEach(function (name) {
+        if (!windowNamesAtStart[name] && !reportedNewNames[name]) { reportedNewNames[name] = true; added.push(name + ':' + (function () { try { return typeof window[name]; } catch (e) { return 'err'; } })()); }
+      });
+    } catch (e) {}
+    log('info', 'globals added since script start, ' + when + ': ' + (added.length ? added.join(', ') : '(none new)'));
+  }
+
+  // The object itself: own names with their types, the prototype chain, the arity and the source text of call.
+  function describeBridgeObject(label) {
+    var bridge = window.tngdJSBridge;
+    if (!bridge) { log('bad', label + ': no window.tngdJSBridge object'); return; }
+    var chain = [];
+    var proto = Object.getPrototypeOf(bridge);
+    while (proto && proto !== Object.prototype && chain.length < 5) { chain.push((proto.constructor && proto.constructor.name) || '(anonymous)'); proto = Object.getPrototypeOf(proto); }
+    log('info', label + ': tngdJSBridge own names: ' + describeDeep(bridge));
+    log('info', label + ': tngdJSBridge prototype chain: ' + (chain.length ? chain.join(' -> ') : 'Object.prototype only'));
+    if (typeof bridge.call === 'function') {
+      var source = '';
+      try { source = Function.prototype.toString.call(bridge.call); } catch (e) { source = '[toString throws: ' + e.message + ']'; }
+      log('info', label + ': tngdJSBridge.call length=' + bridge.call.length + ' source=' + source.slice(0, 400));
+    }
+  }
+
+  // Every event the page can see: a capturing listener per name on document and on window, and a wrapper over dispatchEvent for events scripts dispatch. A native dispatch bypasses the wrapper, which the listeners still catch for the names listed.
+  var eventNames = ['tngdJSBridgeReady', 'AlipayJSBridgeReady', 'JSBridgeReady', 'h5ContainerReady', 'message', 'DOMContentLoaded', 'load', 'pageshow', 'pagehide', 'visibilitychange', 'resume', 'pause', 'back', 'appear', 'disappear', 'focus', 'blur'];
+  function describeEvent(e) {
+    var own = {};
+    try { Object.getOwnPropertyNames(e).forEach(function (name) { own[name] = describeDeep(e[name], 1); }); } catch (err) {}
+    return 'type=' + e.type + ' isTrusted=' + e.isTrusted + ' bubbles=' + e.bubbles + ' target=' + (e.target && (e.target.nodeName || e.target.constructor && e.target.constructor.name)) + ' detail=' + describeDeep(e.detail) + ' data=' + ('data' in e ? describeDeep(e.data) : '(none)') + ' origin=' + (e.origin || '(none)') + ' own=' + JSON.stringify(own);
+  }
+  eventNames.forEach(function (name) {
+    [document, window].forEach(function (target) {
+      target.addEventListener(name, function (e) {
+        log('info', 'event on ' + (target === window ? 'window' : 'document') + ': ' + describeEvent(e));
+      }, true);
+    });
+  });
+  var originalDispatch = EventTarget.prototype.dispatchEvent;
+  EventTarget.prototype.dispatchEvent = function (e) {
+    try { log('info', 'dispatchEvent by script on ' + (this === window ? 'window' : this === document ? 'document' : (this && this.nodeName) || 'object') + ': ' + describeEvent(e)); } catch (err) {}
+    return originalDispatch.apply(this, arguments);
   };
 
   var loaderFinished = false;
@@ -128,6 +203,8 @@
         function (result) {
           answers += 1;
           log('ok', 'call ' + callNumber + ' answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describe(result));
+          log('info', 'call ' + callNumber + ' answer member types: ' + describeDeep(result));
+          if (answers === 1) { callExtraActions(); }
         }
       );
       if (returned !== undefined) { log('info', 'call ' + callNumber + ' returned synchronously: ' + describe(returned)); }
@@ -152,7 +229,27 @@
     });
   }
 
+  var extraActionsCalled = false;
+  // Read-only actions through the same object, to learn whether it dispatches more than getAuthCode. Nothing here pays or links.
+  function callExtraActions() {
+    if (extraActionsCalled || !window.tngdJSBridge) { return; }
+    extraActionsCalled = true;
+    settings.extraActions.forEach(function (action) {
+      var sentAt = Math.round(performance.now() - t0);
+      log('info', 'extra action ' + action + ': tngdJSBridge.call sent');
+      try {
+        window.tngdJSBridge.call(action, {}, function (result) {
+          log('ok', 'extra action ' + action + ' answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describeDeep(result));
+        });
+      } catch (e) {
+        log('bad', 'extra action ' + action + ' threw: ' + (e && e.message ? e.message : describe(e)));
+      }
+    });
+  }
+
   function onBridgeAvailable(source) {
+    describeBridgeObject(source);
+    logNewWindowNames(source);
     if (settings.mode === 'immediate' || settings.mode === 'both') {
       callTngdBridge(source + ', immediate');
     }
@@ -165,9 +262,9 @@
     callMyGetAuthCode(source);
   }
 
-  document.addEventListener('tngdJSBridgeReady', function () {
+  document.addEventListener('tngdJSBridgeReady', function (e) {
     received = true;
-    log('ok', 'tngdJSBridgeReady fired on document, readyState=' + document.readyState);
+    log('ok', 'tngdJSBridgeReady fired on document, readyState=' + document.readyState + ', event: ' + describeEvent(e));
     onBridgeAvailable('the ready event');
   });
   document.addEventListener('AlipayJSBridgeReady', function () {
@@ -184,6 +281,8 @@
     setTimeout(function () {
       var kind = received && answers > 0 ? 'info' : 'bad';
       log(kind, ms + 'ms check: event received=' + received + ' calls=' + calls + ' answers=' + answers + ' loader finished=' + loaderFinished + ' typeof tngdJSBridge=' + typeof window.tngdJSBridge + ' typeof my=' + typeof window.my + ' scripts in document=' + document.scripts.length);
+      if (ms === 1000 || ms === 10000) { logNewWindowNames(ms + 'ms check'); }
+      if (ms === 10000 && !extraActionsCalled) { callExtraActions(); }
       if (ms === 3000 && !received) {
         callMyGetAuthCode('the 3 second check, without any ready event');
       }
