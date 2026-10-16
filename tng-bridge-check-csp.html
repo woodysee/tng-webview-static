@@ -22,7 +22,7 @@
 </head>
 <body>
 <h1>TnG bridge check (production CSP)</h1>
-<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 10 seconds, then screenshot the whole list and send it back.</p>
+<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then screenshot the whole list and send it back. Query parameters: clientId, redirectUrl, scopes (comma separated), and mode (immediate, afterFinish or both).</p>
 <div id="log"></div>
 <script nonce="probe2026101500000000">
 (function () {
@@ -38,12 +38,28 @@
     try { return typeof value === 'string' ? value : JSON.stringify(value); } catch (e) { return String(value); }
   }
 
+  var query = new URLSearchParams(location.search);
+  var settings = {
+    clientId: query.get('clientId') || 'dummy-client-id',
+    redirectUrl: query.get('redirectUrl') || 'https://www.google.com',
+    scopes: (query.get('scopes') || 'BASE_USER_INFO').split(','),
+    mode: query.get('mode') || 'both'
+  };
+
+  var loaderFinished = false;
+  var pendingAfterFinish = null;
+
   // The container's own loader logs lines such as "jsapi load start" to the console. Mirroring the console here puts those lines on screen.
   ['log', 'info', 'warn', 'error'].forEach(function (level) {
     var original = console[level];
     console[level] = function () {
       var parts = Array.prototype.map.call(arguments, describe);
-      log('console', 'console.' + level + ': ' + parts.join(' '));
+      var text = parts.join(' ');
+      log('console', 'console.' + level + ': ' + text);
+      if (text.indexOf('jsapi load finish') !== -1) {
+        loaderFinished = true;
+        if (pendingAfterFinish) { var run = pendingAfterFinish; pendingAfterFinish = null; run(); }
+      }
       if (original) { original.apply(console, arguments); }
     };
   });
@@ -55,6 +71,7 @@
   });
 
   log('info', 'page: ' + location.href);
+  log('info', 'settings: ' + describe(settings));
   log('info', 'referrer: ' + (document.referrer || '(none)'));
   log('info', 'userAgent: ' + navigator.userAgent);
   log('info', 'readyState at script start: ' + document.readyState);
@@ -84,31 +101,39 @@
   });
 
   var received = false;
-  var calledTngdBridge = false;
+  var answers = 0;
+  var calls = 0;
   var calledMy = false;
 
-  // The call the production page makes, through the object the 2024 integration named.
-  function callTngdBridge(source) {
-    if (calledTngdBridge) { return; }
-    calledTngdBridge = true;
-    log('ok', 'calling tngdJSBridge.call getAuthCode via ' + source + ', typeof bridge=' + typeof window.tngdJSBridge);
+  // The call the production page makes, through the object the 2024 integration named. Each call is labelled so the answer names the call it belongs to.
+  function callTngdBridge(label) {
     if (!window.tngdJSBridge) {
-      log('bad', 'no window.tngdJSBridge object at call time');
+      log('bad', label + ': no window.tngdJSBridge object at call time');
       return;
     }
-    window.tngdJSBridge.call(
-      'getAuthCode',
-      {
-        scopes: ['BASE_USER_INFO'],
-        clientId: 'dummy-client-id',
-        redirectUrl: 'https://www.google.com',
-        extRequestId: 'check-' + Date.now(),
-        grantType: 'AUTHORIZATION_CODE'
-      },
-      function (result) {
-        log('ok', 'tngdJSBridge getAuthCode answered: ' + describe(result));
-      }
-    );
+    calls += 1;
+    var callNumber = calls;
+    var sentAt = Math.round(performance.now() - t0);
+    log('ok', 'call ' + callNumber + ' (' + label + '): tngdJSBridge.call getAuthCode, typeof bridge=' + typeof window.tngdJSBridge + ', typeof call=' + typeof window.tngdJSBridge.call);
+    try {
+      var returned = window.tngdJSBridge.call(
+        'getAuthCode',
+        {
+          scopes: settings.scopes,
+          clientId: settings.clientId,
+          redirectUrl: settings.redirectUrl,
+          extRequestId: 'check-' + callNumber + '-' + Date.now(),
+          grantType: 'AUTHORIZATION_CODE'
+        },
+        function (result) {
+          answers += 1;
+          log('ok', 'call ' + callNumber + ' answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describe(result));
+        }
+      );
+      if (returned !== undefined) { log('info', 'call ' + callNumber + ' returned synchronously: ' + describe(returned)); }
+    } catch (e) {
+      log('bad', 'call ' + callNumber + ' threw: ' + (e && e.message ? e.message : describe(e)));
+    }
   }
 
   // The call the public mini program portal documents for an H5 page (the JSAPI web-bridge).
@@ -127,11 +152,23 @@
     });
   }
 
+  function onBridgeAvailable(source) {
+    if (settings.mode === 'immediate' || settings.mode === 'both') {
+      callTngdBridge(source + ', immediate');
+    }
+    if (settings.mode === 'afterFinish' || settings.mode === 'both') {
+      var runAfterFinish = function () {
+        setTimeout(function () { callTngdBridge('500ms after jsapi load finish'); }, 500);
+      };
+      if (loaderFinished) { runAfterFinish(); } else { pendingAfterFinish = runAfterFinish; }
+    }
+    callMyGetAuthCode(source);
+  }
+
   document.addEventListener('tngdJSBridgeReady', function () {
     received = true;
     log('ok', 'tngdJSBridgeReady fired on document, readyState=' + document.readyState);
-    callTngdBridge('the ready event');
-    callMyGetAuthCode('the ready event');
+    onBridgeAvailable('the ready event');
   });
   document.addEventListener('AlipayJSBridgeReady', function () {
     log('info', 'AlipayJSBridgeReady fired on document (the Alipay name, not the TnG one)');
@@ -140,15 +177,19 @@
 
   if (window.tngdJSBridge) {
     log('ok', 'bridge object already present at script start');
-    callTngdBridge('the mount-time check');
-    callMyGetAuthCode('the mount-time check');
+    onBridgeAvailable('the mount-time check');
   }
 
-  [1000, 3000, 10000].forEach(function (ms) {
+  [1000, 3000, 10000, 30000].forEach(function (ms) {
     setTimeout(function () {
-      log(received ? 'info' : 'bad', ms + 'ms check: event received=' + received + ' typeof tngdJSBridge=' + typeof window.tngdJSBridge + ' typeof my=' + typeof window.my + ' scripts in document=' + document.scripts.length);
+      var kind = received && answers > 0 ? 'info' : 'bad';
+      log(kind, ms + 'ms check: event received=' + received + ' calls=' + calls + ' answers=' + answers + ' loader finished=' + loaderFinished + ' typeof tngdJSBridge=' + typeof window.tngdJSBridge + ' typeof my=' + typeof window.my + ' scripts in document=' + document.scripts.length);
       if (ms === 3000 && !received) {
         callMyGetAuthCode('the 3 second check, without any ready event');
+      }
+      if (ms === 10000 && pendingAfterFinish) {
+        log('bad', 'jsapi load finish never logged, so the after-finish call did not run. Running it now.');
+        var run = pendingAfterFinish; pendingAfterFinish = null; run();
       }
     }, ms);
   });
