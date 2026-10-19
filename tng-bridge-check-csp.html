@@ -85,19 +85,19 @@
     log('info', 'globals added since script start, ' + when + ': ' + (added.length ? added.join(', ') : '(none new)'));
   }
 
-  // The object itself: own names with their types, the prototype chain, the arity and the source text of call.
-  function describeBridgeObject(label) {
-    var bridge = window.tngdJSBridge;
-    if (!bridge) { log('bad', label + ': no window.tngdJSBridge object'); return; }
+  // The object itself: own names with their types, the prototype chain, the arity and the source text of call. The container injects one of two names: tngdJSBridge in the TnG H5 container, AlipayJSBridge in the Alipay+ mini program container.
+  function describeBridgeObject(bridgeName, label) {
+    var bridge = window[bridgeName];
+    if (!bridge) { log('bad', label + ': no window.' + bridgeName + ' object'); return; }
     var chain = [];
     var proto = Object.getPrototypeOf(bridge);
     while (proto && proto !== Object.prototype && chain.length < 5) { chain.push((proto.constructor && proto.constructor.name) || '(anonymous)'); proto = Object.getPrototypeOf(proto); }
-    log('info', label + ': tngdJSBridge own names: ' + describeDeep(bridge));
-    log('info', label + ': tngdJSBridge prototype chain: ' + (chain.length ? chain.join(' -> ') : 'Object.prototype only'));
+    log('info', label + ': ' + bridgeName + ' own names: ' + describeDeep(bridge));
+    log('info', label + ': ' + bridgeName + ' prototype chain: ' + (chain.length ? chain.join(' -> ') : 'Object.prototype only'));
     if (typeof bridge.call === 'function') {
       var source = '';
       try { source = Function.prototype.toString.call(bridge.call); } catch (e) { source = '[toString throws: ' + e.message + ']'; }
-      log('info', label + ': tngdJSBridge.call length=' + bridge.call.length + ' source=' + source.slice(0, 400));
+      log('info', label + ': ' + bridgeName + '.call length=' + bridge.call.length + ' source=' + source.slice(0, 400));
     }
   }
 
@@ -180,18 +180,19 @@
   var calls = 0;
   var calledMy = false;
 
-  // The call the production page makes, through the object the 2024 integration named. Each call is labelled so the answer names the call it belongs to.
-  function callTngdBridge(label) {
-    if (!window.tngdJSBridge) {
-      log('bad', label + ': no window.tngdJSBridge object at call time');
+  // The call the production page makes, through whichever bridge object the container injected. Each call is labelled with the object and a number, so the answer names the call it belongs to.
+  function callBridge(bridgeName, label) {
+    var bridge = window[bridgeName];
+    if (!bridge) {
+      log('bad', label + ': no window.' + bridgeName + ' object at call time');
       return;
     }
     calls += 1;
     var callNumber = calls;
     var sentAt = Math.round(performance.now() - t0);
-    log('ok', 'call ' + callNumber + ' (' + label + '): tngdJSBridge.call getAuthCode, typeof bridge=' + typeof window.tngdJSBridge + ', typeof call=' + typeof window.tngdJSBridge.call);
+    log('ok', 'call ' + callNumber + ' (' + label + '): ' + bridgeName + '.call getAuthCode, typeof bridge=' + typeof bridge + ', typeof call=' + typeof bridge.call);
     try {
-      var returned = window.tngdJSBridge.call(
+      var returned = bridge.call(
         'getAuthCode',
         {
           scopes: settings.scopes,
@@ -202,9 +203,9 @@
         },
         function (result) {
           answers += 1;
-          log('ok', 'call ' + callNumber + ' answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describe(result));
+          log('ok', 'call ' + callNumber + ' (' + bridgeName + ') answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describe(result));
           log('info', 'call ' + callNumber + ' answer member types: ' + describeDeep(result));
-          if (answers === 1) { callExtraActions(); }
+          if (answers === 1) { callExtraActions(bridgeName); }
         }
       );
       if (returned !== undefined) { log('info', 'call ' + callNumber + ' returned synchronously: ' + describe(returned)); }
@@ -231,15 +232,16 @@
 
   var extraActionsCalled = false;
   // Read-only actions through the same object, to learn whether it dispatches more than getAuthCode. Nothing here pays or links.
-  function callExtraActions() {
-    if (extraActionsCalled || !window.tngdJSBridge) { return; }
+  function callExtraActions(bridgeName) {
+    var bridge = window[bridgeName];
+    if (extraActionsCalled || !bridge) { return; }
     extraActionsCalled = true;
     settings.extraActions.forEach(function (action) {
       var sentAt = Math.round(performance.now() - t0);
-      log('info', 'extra action ' + action + ': tngdJSBridge.call sent');
+      log('info', 'extra action ' + action + ': ' + bridgeName + '.call sent');
       try {
-        window.tngdJSBridge.call(action, {}, function (result) {
-          log('ok', 'extra action ' + action + ' answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describeDeep(result));
+        bridge.call(action, {}, function (result) {
+          log('ok', 'extra action ' + action + ' (' + bridgeName + ') answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describeDeep(result));
         });
       } catch (e) {
         log('bad', 'extra action ' + action + ' threw: ' + (e && e.message ? e.message : describe(e)));
@@ -247,15 +249,15 @@
     });
   }
 
-  function onBridgeAvailable(source) {
-    describeBridgeObject(source);
+  function onBridgeAvailable(bridgeName, source) {
+    describeBridgeObject(bridgeName, source);
     logNewWindowNames(source);
     if (settings.mode === 'immediate' || settings.mode === 'both') {
-      callTngdBridge(source + ', immediate');
+      callBridge(bridgeName, source + ', immediate');
     }
     if (settings.mode === 'afterFinish' || settings.mode === 'both') {
       var runAfterFinish = function () {
-        setTimeout(function () { callTngdBridge('500ms after jsapi load finish'); }, 500);
+        setTimeout(function () { callBridge(bridgeName, '500ms after jsapi load finish'); }, 500);
       };
       if (loaderFinished) { runAfterFinish(); } else { pendingAfterFinish = runAfterFinish; }
     }
@@ -265,26 +267,35 @@
   document.addEventListener('tngdJSBridgeReady', function (e) {
     received = true;
     log('ok', 'tngdJSBridgeReady fired on document, readyState=' + document.readyState + ', event: ' + describeEvent(e));
-    onBridgeAvailable('the ready event');
+    onBridgeAvailable('tngdJSBridge', 'the tngd ready event');
   });
-  document.addEventListener('AlipayJSBridgeReady', function () {
-    log('info', 'AlipayJSBridgeReady fired on document (the Alipay name, not the TnG one)');
+  // The Alipay+ mini program container names the object AlipayJSBridge and fires AlipayJSBridgeReady, the form the mPaaS H5 container documents. The same getAuthCode call goes through it, so the answer shows whether a page that supports both names would complete there.
+  document.addEventListener('AlipayJSBridgeReady', function (e) {
+    received = true;
+    log('ok', 'AlipayJSBridgeReady fired on document, readyState=' + document.readyState + ', event: ' + describeEvent(e));
+    onBridgeAvailable('AlipayJSBridge', 'the Alipay ready event');
     callMyGetAuthCode('the Alipay ready event');
   });
 
   if (window.tngdJSBridge) {
-    log('ok', 'bridge object already present at script start');
-    onBridgeAvailable('the mount-time check');
+    log('ok', 'tngdJSBridge object already present at script start');
+    onBridgeAvailable('tngdJSBridge', 'the mount-time check');
+  }
+  if (window.AlipayJSBridge) {
+    log('ok', 'AlipayJSBridge object already present at script start');
+    onBridgeAvailable('AlipayJSBridge', 'the mount-time check');
   }
 
   [1000, 3000, 10000, 30000].forEach(function (ms) {
     setTimeout(function () {
       var kind = received && answers > 0 ? 'info' : 'bad';
-      log(kind, ms + 'ms check: event received=' + received + ' calls=' + calls + ' answers=' + answers + ' loader finished=' + loaderFinished + ' typeof tngdJSBridge=' + typeof window.tngdJSBridge + ' typeof my=' + typeof window.my + ' scripts in document=' + document.scripts.length);
+      log(kind, ms + 'ms check: event received=' + received + ' calls=' + calls + ' answers=' + answers + ' loader finished=' + loaderFinished + ' typeof tngdJSBridge=' + typeof window.tngdJSBridge + ' typeof AlipayJSBridge=' + typeof window.AlipayJSBridge + ' typeof my=' + typeof window.my + ' scripts in document=' + document.scripts.length);
       if (ms === 1000 || ms === 10000) { logNewWindowNames(ms + 'ms check'); }
-      if (ms === 10000 && !extraActionsCalled) { callExtraActions(); }
+      if (ms === 10000 && !extraActionsCalled) { callExtraActions(window.tngdJSBridge ? 'tngdJSBridge' : 'AlipayJSBridge'); }
       if (ms === 3000 && !received) {
         callMyGetAuthCode('the 3 second check, without any ready event');
+        if (window.tngdJSBridge) { onBridgeAvailable('tngdJSBridge', 'the 3 second check, without any ready event'); }
+        if (window.AlipayJSBridge) { onBridgeAvailable('AlipayJSBridge', 'the 3 second check, without any ready event'); }
       }
       if (ms === 10000 && pendingAfterFinish) {
         log('bad', 'jsapi load finish never logged, so the after-finish call did not run. Running it now.');
