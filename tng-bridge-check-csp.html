@@ -22,8 +22,13 @@
 </head>
 <body>
 <h1>TnG bridge check (production CSP)</h1>
-<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then screenshot the whole list and send it back. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none).</p>
+<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then press Copy JSON and Copy TypeScript draft under the list and send both, or screenshot the whole list. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none).</p>
 <div id="log"></div>
+<h2>Shape report</h2>
+<p>The report holds member names, types, function arity and function source of each bridge object found, and the inferred type of each answer. It holds no answer value. Press a button, then paste the text into the ticket cache. The JSON is for comparing runs. The TypeScript is a draft interface that needs review.</p>
+<p><button id="copy-json" type="button">Copy JSON</button> <button id="copy-ts" type="button">Copy TypeScript draft</button> <button id="refresh-shape" type="button">Refresh</button></p>
+<textarea id="shape-json" readonly rows="10" style="width:100%;font:11px monospace" aria-label="Shape report as JSON"></textarea>
+<textarea id="shape-ts" readonly rows="10" style="width:100%;font:11px monospace" aria-label="Draft TypeScript interface"></textarea>
 <script nonce="probe2026101500000000">
 (function () {
   var t0 = performance.now();
@@ -99,6 +104,257 @@
       try { source = Function.prototype.toString.call(bridge.call); } catch (e) { source = '[toString throws: ' + e.message + ']'; }
       log('info', label + ': ' + bridgeName + '.call length=' + bridge.call.length + ' source=' + source.slice(0, 400));
     }
+  }
+
+  // ---- Shape report ----
+  // Reflection reads descriptors, arity, names and source text. It never calls a member of a bridge. The report holds types and member names, and never an answer value, because an answer to getAuthCode holds a live auth code.
+  var MAX_REFLECT_DEPTH = 4;
+  var MAX_MEMBERS = 200;
+  var SOURCE_LIMIT = 6000;
+  var shapeSnapshots = {};
+  var observedAnswerTypes = {};
+
+  function safeToString(fn) {
+    try { return Function.prototype.toString.call(fn); } catch (e) { return '[toString throws: ' + e.message + ']'; }
+  }
+  function constructorName(value) {
+    try { var proto = Object.getPrototypeOf(value); return (proto && proto.constructor && proto.constructor.name) || null; } catch (e) { return null; }
+  }
+  function parseParameterNames(source) {
+    var list = source.match(/^\s*(?:async\s+)?(?:function\s*\*?\s*[\w$]*\s*)?\(([^)]*)\)\s*(?:=>|\{)/) || source.match(/^\s*(?:async\s+)?[\w$]+\s*\(([^)]*)\)\s*\{/);
+    if (list) {
+      return list[1].replace(/\/\*[\s\S]*?\*\//g, '').split(',').map(function (part) { return part.replace(/=[\s\S]*$/, '').trim(); }).filter(function (part) { return part; });
+    }
+    var single = source.match(/^\s*(?:async\s+)?([\w$]+)\s*=>/);
+    return single ? [single[1]] : null;
+  }
+  function describeFunction(fn) {
+    var source = safeToString(fn);
+    var isNative = /\[native code\]/.test(source);
+    return {
+      kind: 'function',
+      name: fn.name,
+      length: fn.length,
+      isNative: isNative,
+      isAsync: /^\s*async\b/.test(source),
+      isArrow: /^\s*(?:async\s+)?(?:\([^)]*\)|[\w$]+)\s*=>/.test(source),
+      parameterNames: isNative ? null : parseParameterNames(source),
+      source: source.length > SOURCE_LIMIT ? source.slice(0, SOURCE_LIMIT) + '...[truncated ' + (source.length - SOURCE_LIMIT) + ' chars]' : source
+    };
+  }
+  function reflectValue(value, depth, seen) {
+    var type = typeof value;
+    if (value === null) { return { kind: 'null' }; }
+    if (type === 'undefined') { return { kind: 'undefined' }; }
+    if (type === 'function') { return describeFunction(value); }
+    if (type === 'string') { return { kind: 'string', value: value.length > 200 ? value.slice(0, 200) + '...' : value }; }
+    if (type === 'number' || type === 'boolean') { return { kind: type, value: value }; }
+    if (type !== 'object') { return { kind: type, value: String(value) }; }
+    if (seen.indexOf(value) !== -1) { return { kind: 'cycle' }; }
+    if (depth > MAX_REFLECT_DEPTH) { return { kind: 'depth-limit', constructorName: constructorName(value) }; }
+    seen.push(value);
+    return reflectObject(value, depth, seen);
+  }
+  function reflectObject(obj, depth, seen) {
+    var out = {
+      kind: Array.isArray(obj) ? 'array' : 'object',
+      constructorName: constructorName(obj),
+      frozen: Object.isFrozen(obj), sealed: Object.isSealed(obj), extensible: Object.isExtensible(obj),
+      members: {}, symbols: [], prototypeChain: []
+    };
+    var names = [];
+    try { names = Object.getOwnPropertyNames(obj); } catch (e) { out.error = 'getOwnPropertyNames threw: ' + e.message; return out; }
+    names.slice(0, MAX_MEMBERS).forEach(function (name) {
+      var descriptor;
+      try { descriptor = Object.getOwnPropertyDescriptor(obj, name); } catch (e) { out.members[name] = { error: 'descriptor threw: ' + e.message }; return; }
+      var entry = { enumerable: descriptor.enumerable, configurable: descriptor.configurable };
+      if ('value' in descriptor) {
+        entry.writable = descriptor.writable;
+        entry.type = reflectValue(descriptor.value, depth + 1, seen);
+      } else {
+        entry.accessor = { get: descriptor.get ? describeFunction(descriptor.get) : null, set: descriptor.set ? describeFunction(descriptor.set) : null };
+      }
+      out.members[name] = entry;
+    });
+    if (names.length > MAX_MEMBERS) { out.truncatedMembers = names.length - MAX_MEMBERS; }
+    try { out.symbols = Object.getOwnPropertySymbols(obj).map(String); } catch (e) {}
+    try {
+      var proto = Object.getPrototypeOf(obj);
+      while (proto && proto !== Object.prototype && out.prototypeChain.length < 5) {
+        var level = { constructorName: (proto.constructor && proto.constructor.name) || null, members: {} };
+        Object.getOwnPropertyNames(proto).forEach(function (name) {
+          if (name === 'constructor') { return; }
+          try { var d = Object.getOwnPropertyDescriptor(proto, name); level.members[name] = 'value' in d ? (typeof d.value === 'function' ? 'function(' + d.value.length + ')' : typeof d.value) : 'accessor'; } catch (e) { level.members[name] = 'unreadable'; }
+        });
+        out.prototypeChain.push(level);
+        proto = Object.getPrototypeOf(proto);
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  function tsIdentifier(name) { return /^[A-Za-z_$][\w$]*$/.test(name) ? name : JSON.stringify(name); }
+  function tsParameters(fn) {
+    var names = fn.parameterNames;
+    var list = [];
+    for (var i = 0; i < fn.length; i += 1) {
+      var name = names && names[i] ? names[i] : 'arg' + i;
+      list.push((/^\.\.\./.test(name) ? '...' + name.slice(3) + ': unknown[]' : name + ': unknown'));
+    }
+    if (names && names.length > fn.length) {
+      names.slice(fn.length).forEach(function (name) { list.push(/^\.\.\./.test(name) ? '...' + name.slice(3) + ': unknown[]' : name + '?: unknown'); });
+    }
+    return list.join(', ');
+  }
+  function tsFromReflection(r, indent) {
+    var pad = new Array(indent + 1).join('  ');
+    if (!r) { return 'unknown'; }
+    if (r.kind === 'string' || r.kind === 'number' || r.kind === 'boolean' || r.kind === 'null' || r.kind === 'undefined' || r.kind === 'symbol') { return r.kind; }
+    if (r.kind === 'function') { return '(' + tsParameters(r) + ') => unknown'; }
+    if (r.kind === 'array') { return 'unknown[]'; }
+    if (r.kind !== 'object') { return 'unknown'; }
+    var names = Object.keys(r.members);
+    if (!names.length) { return 'Record<string, never>'; }
+    var lines = names.map(function (name) {
+      var m = r.members[name];
+      var id = tsIdentifier(name);
+      if (m.error) { return pad + '  ' + id + ': unknown; // ' + m.error; }
+      if (m.accessor) { return pad + '  readonly ' + id + ': unknown; // accessor' + (m.accessor.set ? ' with a setter' : ''); }
+      var note = m.enumerable ? '' : ' // not enumerable';
+      if (m.type.kind === 'function') { return pad + '  ' + id + '(' + tsParameters(m.type) + '): unknown;' + (m.type.isNative ? ' // native, parameter names unknown' : (m.type.parameterNames ? '' : ' // parameter names not parsed')) + note; }
+      return pad + '  ' + (m.writable ? '' : 'readonly ') + id + ': ' + tsFromReflection(m.type, indent + 1) + ';' + note;
+    });
+    return '{\n' + lines.join('\n') + '\n' + pad + '}';
+  }
+  function inferTs(value, depth, seen) {
+    if (value === null) { return 'null'; }
+    var type = typeof value;
+    if (type === 'undefined' || type === 'string' || type === 'number' || type === 'boolean') { return type; }
+    if (type === 'function') { return '(' + tsParameters(describeFunction(value)) + ') => unknown'; }
+    if (type !== 'object' || depth > MAX_REFLECT_DEPTH || seen.indexOf(value) !== -1) { return 'unknown'; }
+    seen.push(value);
+    if (Array.isArray(value)) {
+      var kinds = [];
+      value.forEach(function (item) { var k = inferTs(item, depth + 1, seen); if (kinds.indexOf(k) === -1) { kinds.push(k); } });
+      return kinds.length === 0 ? 'unknown[]' : kinds.length === 1 ? kinds[0] + '[]' : '(' + kinds.join(' | ') + ')[]';
+    }
+    var keys = Object.keys(value);
+    if (!keys.length) { return 'Record<string, never>'; }
+    return '{ ' + keys.map(function (k) { return tsIdentifier(k) + ': ' + inferTs(value[k], depth + 1, seen) + ';'; }).join(' ') + ' }';
+  }
+  function recordAnswer(bridgeName, action, value) {
+    var key = bridgeName + '.' + action;
+    var inferred = inferTs(value, 0, []);
+    observedAnswerTypes[key] = observedAnswerTypes[key] || [];
+    if (observedAnswerTypes[key].indexOf(inferred) === -1) { observedAnswerTypes[key].push(inferred); }
+    scheduleShapeRefresh();
+  }
+
+  function captureBridgeShape(bridgeName, label) {
+    var bridge = window[bridgeName];
+    if (!bridge) { return; }
+    var snapshot = { reflection: reflectValue(bridge, 0, []), label: label, atMs: Math.round(performance.now() - t0) };
+    var existing = shapeSnapshots[bridgeName];
+    shapeSnapshots[bridgeName] = existing ? { first: existing.first, latest: snapshot } : { first: snapshot, latest: snapshot };
+  }
+  function scanWindowCandidates() {
+    var found = {};
+    try {
+      Object.getOwnPropertyNames(window).forEach(function (name) {
+        if (!/bridge|jsapi|alipay|tng|ariver|griver|aliapp|^my$|native/i.test(name)) { return; }
+        try { var v = window[name]; found[name] = typeof v === 'function' ? 'function(' + v.length + ')' : v === null ? 'null' : typeof v; } catch (e) { found[name] = 'unreadable'; }
+      });
+    } catch (e) {}
+    return found;
+  }
+  function scanMessageHandlers() {
+    var names = [];
+    try {
+      var handlers = window.webkit && window.webkit.messageHandlers;
+      if (handlers) { names = Object.getOwnPropertyNames(handlers).concat(Object.keys(handlers)).filter(function (n, i, all) { return all.indexOf(n) === i; }); }
+    } catch (e) {}
+    return names;
+  }
+  function addedGlobals() {
+    var added = {};
+    try {
+      Object.getOwnPropertyNames(window).forEach(function (name) {
+        if (windowNamesAtStart[name]) { return; }
+        try { var v = window[name]; added[name] = typeof v === 'function' ? 'function(' + v.length + ')' : typeof v; } catch (e) { added[name] = 'unreadable'; }
+      });
+    } catch (e) {}
+    return added;
+  }
+  function pascal(name) { return name.charAt(0).toUpperCase() + name.slice(1); }
+
+  function buildShapeReport() {
+    ['tngdJSBridge', 'AlipayJSBridge'].forEach(function (name) {
+      if (window[name]) { captureBridgeShape(name, shapeSnapshots[name] ? 'refresh' : 'first refresh'); }
+    });
+    var report = {
+      reportVersion: 1,
+      note: 'Types, names and function source only. No answer value is recorded.',
+      page: location.origin + location.pathname,
+      userAgent: navigator.userAgent,
+      atMs: Math.round(performance.now() - t0),
+      bridges: {},
+      answerTypes: observedAnswerTypes,
+      windowCandidates: scanWindowCandidates(),
+      webkitMessageHandlers: scanMessageHandlers(),
+      globalsAddedAfterStart: addedGlobals()
+    };
+    Object.keys(shapeSnapshots).forEach(function (name) {
+      var snap = shapeSnapshots[name];
+      var firstNames = Object.keys(snap.first.reflection.members || {});
+      var lateNames = Object.keys(snap.latest.reflection.members || {});
+      report.bridges[name] = {
+        firstSeen: { label: snap.first.label, atMs: snap.first.atMs },
+        latest: { label: snap.latest.label, atMs: snap.latest.atMs },
+        membersAddedAfterFirstSeen: lateNames.filter(function (n) { return firstNames.indexOf(n) === -1; }),
+        reflection: snap.latest.reflection
+      };
+    });
+    return report;
+  }
+  function buildTypeScriptDraft(report) {
+    var out = ['// Draft from observation on ' + report.userAgent, '// Review every member. A type here is what the container did at one moment, and unknown means no value was observed.', ''];
+    Object.keys(report.bridges).forEach(function (name) {
+      out.push('export interface ' + pascal(name) + 'Observed ' + tsFromReflection(report.bridges[name].reflection, 0));
+      out.push('');
+    });
+    Object.keys(report.answerTypes).forEach(function (key) {
+      var alias = key.split('.').map(pascal).join('') + 'Answer';
+      out.push('export type ' + alias + ' = ' + report.answerTypes[key].join(' | ') + ';');
+    });
+    return out.join('\n');
+  }
+
+  var shapeTimer = null;
+  function refreshShapeReport() {
+    var report = buildShapeReport();
+    var jsonEl = document.getElementById('shape-json');
+    var tsEl = document.getElementById('shape-ts');
+    if (jsonEl) { jsonEl.value = JSON.stringify(report, null, 2); }
+    if (tsEl) { tsEl.value = buildTypeScriptDraft(report); }
+    return report;
+  }
+  function scheduleShapeRefresh() {
+    if (shapeTimer) { return; }
+    shapeTimer = setTimeout(function () { shapeTimer = null; refreshShapeReport(); }, 300);
+  }
+  function copyFrom(id, label) {
+    var el = document.getElementById(id);
+    if (!el) { return; }
+    refreshShapeReport();
+    el.focus(); el.select();
+    try { el.setSelectionRange(0, el.value.length); } catch (e) {}
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    if (!ok && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(el.value).then(function () { log('ok', label + ' copied'); }, function () { log('bad', label + ' could not be copied, select the text and copy it by hand'); });
+      return;
+    }
+    log(ok ? 'ok' : 'bad', label + (ok ? ' copied' : ' could not be copied, select the text and copy it by hand'));
   }
 
   // Every event the page can see: a capturing listener per name on document and on window, and a wrapper over dispatchEvent for events scripts dispatch. A native dispatch bypasses the wrapper, which the listeners still catch for the names listed.
@@ -205,6 +461,7 @@
           answers += 1;
           log('ok', 'call ' + callNumber + ' (' + bridgeName + ') answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describe(result));
           log('info', 'call ' + callNumber + ' answer member types: ' + describeDeep(result));
+          recordAnswer(bridgeName, 'getAuthCode', result);
           if (answers === 1) { callExtraActions(bridgeName); }
         }
       );
@@ -242,6 +499,7 @@
       try {
         bridge.call(action, {}, function (result) {
           log('ok', 'extra action ' + action + ' (' + bridgeName + ') answered after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + describeDeep(result));
+          recordAnswer(bridgeName, action, result);
         });
       } catch (e) {
         log('bad', 'extra action ' + action + ' threw: ' + (e && e.message ? e.message : describe(e)));
@@ -251,6 +509,7 @@
 
   function onBridgeAvailable(bridgeName, source) {
     describeBridgeObject(bridgeName, source);
+    captureBridgeShape(bridgeName, source);
     logNewWindowNames(source);
     if (settings.mode === 'immediate' || settings.mode === 'both') {
       callBridge(bridgeName, source + ', immediate');
@@ -290,6 +549,8 @@
     setTimeout(function () {
       var kind = received && answers > 0 ? 'info' : 'bad';
       log(kind, ms + 'ms check: event received=' + received + ' calls=' + calls + ' answers=' + answers + ' loader finished=' + loaderFinished + ' typeof tngdJSBridge=' + typeof window.tngdJSBridge + ' typeof AlipayJSBridge=' + typeof window.AlipayJSBridge + ' typeof my=' + typeof window.my + ' scripts in document=' + document.scripts.length);
+      var report = refreshShapeReport();
+      log('info', ms + 'ms shape report: bridges=' + (Object.keys(report.bridges).join(',') || '(none)') + ' answerTypes=' + Object.keys(report.answerTypes).length + ' messageHandlers=' + report.webkitMessageHandlers.length);
       if (ms === 1000 || ms === 10000) { logNewWindowNames(ms + 'ms check'); }
       if (ms === 10000 && !extraActionsCalled) { callExtraActions(window.tngdJSBridge ? 'tngdJSBridge' : 'AlipayJSBridge'); }
       if (ms === 3000 && !received) {
@@ -303,6 +564,10 @@
       }
     }, ms);
   });
+  document.getElementById('copy-json').addEventListener('click', function () { copyFrom('shape-json', 'JSON'); });
+  document.getElementById('copy-ts').addEventListener('click', function () { copyFrom('shape-ts', 'TypeScript draft'); });
+  document.getElementById('refresh-shape').addEventListener('click', function () { refreshShapeReport(); log('info', 'shape report refreshed'); });
+  refreshShapeReport();
 })();
 </script>
 </body>
