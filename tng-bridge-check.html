@@ -16,7 +16,7 @@
 <p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then press the three copy buttons under the list, one part per message, or screenshot the whole list. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none).</p>
 <div id="log"></div>
 <h2>Shape report</h2>
-<p>The report has three parts, so that each part is small enough to paste on its own. Press Copy TypeScript draft first and send it alone. Then press Copy compact JSON and send it. Then press Copy function sources and send it last. The parts hold member names, types, function arity and function source. They hold no answer value and no URL. The TypeScript is a draft that needs review.</p>
+<p>The report has three parts, so that each part is small enough to paste on its own. Press Copy TypeScript draft first and send it alone. Then press Copy compact JSON and send it. Then press Copy function sources and send it last. The parts hold member names, types, function arity and function source. They hold no answer value and no URL. The outcome members of an answer (`success`, `errorCode`, `errorMessage`) are recorded, and the auth code never. The TypeScript is a draft that needs review.</p>
 <p id="shape-sizes"></p>
 <p><button id="copy-ts" type="button">Copy TypeScript draft</button> <button id="copy-json" type="button">Copy compact JSON</button> <button id="copy-sources" type="button">Copy function sources</button> <button id="share-shape" type="button">Share all three as a file</button> <button id="refresh-shape" type="button">Refresh</button></p>
 <textarea id="shape-ts" readonly rows="8" style="width:100%;font:11px monospace" aria-label="Draft TypeScript interface"></textarea>
@@ -245,8 +245,19 @@
     if (!keys.length) { return 'Record<string, never>'; }
     return '{ ' + keys.map(function (k) { return tsIdentifier(k) + ': ' + inferTs(value[k], depth + 1, seen) + ';'; }).join(' ') + ' }';
   }
+  // The members that name the outcome are plain enumerations and not secrets, so their values are recorded. authCode and every other member are never recorded.
+  var SAMPLE_MEMBERS = ['success', 'errorCode', 'errorMessage', 'defaultMessage', 'code', 'resultStatus'];
+  var observedAnswerSamples = {};
   function recordAnswer(bridgeName, action, value) {
     var key = bridgeName + '.' + action;
+    if (value && typeof value === 'object') {
+      var sample = {};
+      SAMPLE_MEMBERS.forEach(function (member) {
+        if (member in value && (typeof value[member] === 'boolean' || (typeof value[member] === 'string' && value[member].length <= 120))) { sample[member] = value[member]; }
+      });
+      observedAnswerSamples[key] = observedAnswerSamples[key] || [];
+      observedAnswerSamples[key].push({ atMs: Math.round(performance.now() - t0), outcome: sample, authCodeIsNonEmptyString: typeof value.authCode === 'string' ? value.authCode.length > 0 : null });
+    }
     var inferred = inferTs(value, 0, []);
     observedAnswerTypes[key] = observedAnswerTypes[key] || [];
     if (observedAnswerTypes[key].indexOf(inferred) === -1) { observedAnswerTypes[key].push(inferred); }
@@ -269,6 +280,16 @@
       });
     } catch (e) {}
     return found;
+  }
+  // The other bridge-like globals, reflected two levels deep, so a global such as the container's startup parameters is described like the bridge itself.
+  function scanCandidateObjects() {
+    var out = {};
+    var candidates = scanWindowCandidates();
+    Object.keys(candidates).forEach(function (name) {
+      if (candidates[name] !== 'object' || name === 'tngdJSBridge' || name === 'AlipayJSBridge') { return; }
+      try { out[name] = reflectValue(window[name], 2, []); } catch (e) { out[name] = { error: e.message }; }
+    });
+    return out;
   }
   function scanMessageHandlers() {
     var names = [];
@@ -302,6 +323,9 @@
       atMs: Math.round(performance.now() - t0),
       bridges: {},
       answerTypes: observedAnswerTypes,
+      answerSamples: observedAnswerSamples,
+      candidateObjects: scanCandidateObjects(),
+      jsBridgeIsAlipayJSBridge: (function () { try { return window.JSBridge === window.AlipayJSBridge; } catch (e) { return null; } })(),
       windowCandidates: scanWindowCandidates(),
       webkitMessageHandlers: scanMessageHandlers(),
       globalsAddedAfterStart: addedGlobals()
