@@ -22,8 +22,11 @@
 </head>
 <body>
 <h1>TnG bridge check (production CSP)</h1>
-<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then press the three copy buttons under the list, one part per message, or screenshot the whole list. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none).</p>
+<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then press the three copy buttons under the list, one part per message, or screenshot the whole list. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none). The Sentry transport check at the 1 second check reads sentryKey (the public key of the DSN, no default, no event is sent without it), sentryEnv (default tng-bridge-check), sentryHost and sentryProject.</p>
+<p><button id="sentry-leave" type="button">Send a Sentry event and leave the page</button> The button sends one event and assigns location.href in the same tick, as the production page does after a failed step. The page comes back with sentryLeft=1. Read Sentry for the event tagged transport=fetch-then-navigate.</p>
+<p><button id="copy-log" type="button">Copy the log</button> <button id="share-log" type="button">Share the log as a file</button> The file holds every line of the list below as plain text, with each auth code and the Sentry key redacted.</p>
 <div id="log"></div>
+<textarea id="log-text" readonly rows="4" style="width:100%;font:11px monospace" aria-label="The log as text"></textarea>
 <h2>Shape report</h2>
 <p>The report has three parts, so that each part is small enough to paste on its own. Press Copy TypeScript draft first and send it alone. Then press Copy compact JSON and send it. Then press Copy function sources and send it last. The parts hold member names, types, function arity and function source. They hold no answer value and no URL. The outcome members of an answer (`success`, `errorCode`, `errorMessage`) are recorded, and the auth code never. The TypeScript is a draft that needs review.</p>
 <p id="shape-sizes"></p>
@@ -488,6 +491,155 @@
     log('bad', 'CSP violation: directive=' + e.violatedDirective + ' blocked=' + e.blockedURI + ' disposition=' + e.disposition + ' sample=' + (e.sample || '(none)'));
   });
 
+  // The production page's Sentry client sends nothing from the TnG webview, while the same build sends from desktop Chrome. The lines below separate the candidate causes without the production page. The SDK refuses to start when a global named chrome or browser carries runtime.id. It takes fetch from a hidden iframe when window.fetch is not native. And the container may refuse every request to the ingest host.
+  var sentry = {
+    host: query.get('sentryHost') || 'o516780.ingest.sentry.io',
+    project: query.get('sentryProject') || '5804787',
+    key: query.get('sentryKey') || '',
+    environment: query.get('sentryEnv') || 'tng-bridge-check',
+    returned: query.get('sentryLeft') === '1',
+    sdk: query.get('sentrySdk') !== '0'
+  };
+  function isNativeFunction(fn) {
+    try { return typeof fn === 'function' && /\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(fn)); } catch (e) { return false; }
+  }
+  function readRuntimeId(name) {
+    try { var owner = window[name]; return owner && owner.runtime ? String(owner.runtime.id) : '(none)'; } catch (e) { return 'err:' + e.message; }
+  }
+  function logSentryEnvironmentFacts() {
+    log('info', 'sentry guard: typeof window.chrome=' + typeof window.chrome + ' chrome.runtime.id=' + readRuntimeId('chrome') + ' typeof window.browser=' + typeof window.browser + ' browser.runtime.id=' + readRuntimeId('browser') + ' typeof window.nw=' + typeof window.nw);
+    var keepaliveKnown = (function () { try { return String('keepalive' in new Request(location.href)); } catch (e) { return 'err:' + e.message; } })();
+    log('info', 'sentry transport: fetch=' + typeof window.fetch + ' native=' + isNativeFunction(window.fetch) + ' XMLHttpRequest.open native=' + isNativeFunction(window.XMLHttpRequest && window.XMLHttpRequest.prototype.open) + ' sendBeacon=' + typeof navigator.sendBeacon + ' Request.keepalive=' + keepaliveKnown);
+    try {
+      var sandbox = document.createElement('iframe');
+      sandbox.hidden = true;
+      document.head.appendChild(sandbox);
+      var sandboxWindow = sandbox.contentWindow;
+      log('info', 'sentry sandbox iframe: contentWindow=' + typeof sandboxWindow + ' fetch=' + (sandboxWindow ? typeof sandboxWindow.fetch : '(no window)') + ' native=' + (sandboxWindow ? isNativeFunction(sandboxWindow.fetch) : false));
+      document.head.removeChild(sandbox);
+    } catch (e) {
+      log('bad', 'sentry sandbox iframe threw: ' + e.message);
+    }
+  }
+  function sentryEndpoint() {
+    var url = 'https://' + sentry.host + '/api/' + sentry.project + '/envelope/';
+    return sentry.key ? url + '?sentry_key=' + encodeURIComponent(sentry.key) + '&sentry_version=7&sentry_client=tng-bridge-check%2F2026.10.20' : url;
+  }
+  function buildSentryEnvelope(transportName) {
+    var eventId = '';
+    while (eventId.length < 32) { eventId += Math.floor(Math.random() * 16).toString(16); }
+    var event = {
+      event_id: eventId,
+      timestamp: Date.now() / 1000,
+      platform: 'javascript',
+      level: 'info',
+      environment: sentry.environment,
+      release: 'tng-bridge-check@2026.10.20',
+      message: 'TnG bridge check page reached the Sentry ingest host',
+      tags: {
+        source: 'tng-bridge-check',
+        transport: transportName,
+        tngdJSBridgeType: typeof window.tngdJSBridge,
+        alipayJSBridgeType: typeof window.AlipayJSBridge,
+        elapsedMs: String(Math.round(performance.now() - t0))
+      },
+      request: { url: location.href.replace(/sentryKey=[^&]*/, 'sentryKey=redacted'), headers: { 'User-Agent': navigator.userAgent } }
+    };
+    var header = { event_id: eventId, sent_at: new Date().toISOString(), sdk: { name: 'tng-bridge-check', version: '2026.10.20' } };
+    return { id: eventId, body: JSON.stringify(header) + '\n' + JSON.stringify({ type: 'event' }) + '\n' + JSON.stringify(event) + '\n' };
+  }
+  // The host is tried first with the key the query gives, or with none. A 4xx answer without a key still proves the request left the container and the host answered. A rejection is retried without CORS, because an opaque answer also proves the host is reachable.
+  function checkSentryHost() {
+    var url = sentryEndpoint();
+    var sentAt = Math.round(performance.now() - t0);
+    if (typeof window.fetch !== 'function') { log('bad', 'sentry host check: window.fetch is not a function'); return; }
+    window.fetch(url, { method: 'POST', body: '{}', keepalive: true }).then(function (response) {
+      log('ok', 'sentry host check: ' + sentry.host + ' answered ' + response.status + ' after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms (a 4xx without a key is a reachable host)');
+    }, function (e) {
+      log('bad', 'sentry host check: fetch to ' + sentry.host + ' rejected after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms: ' + (e && e.message ? e.message : describe(e)));
+      window.fetch(url, { method: 'POST', body: '{}', mode: 'no-cors' }).then(function (response) {
+        log('info', 'sentry host check: the no-cors retry resolved with type=' + response.type + ', so the host is reachable and the CORS answer was refused');
+      }, function (e2) {
+        log('bad', 'sentry host check: the no-cors retry rejected too: ' + (e2 && e2.message ? e2.message : describe(e2)) + ', so no request to the host reaches the network from this container');
+      });
+    });
+  }
+  // One event per transport, each tagged with the transport name, so the Sentry issue list shows which transports deliver from this container.
+  function sendSentryEvent(transportName) {
+    var envelope = buildSentryEnvelope(transportName);
+    var url = sentryEndpoint();
+    var sentAt = Math.round(performance.now() - t0);
+    function finish(kind, text) { log(kind, 'sentry event ' + envelope.id + ' via ' + transportName + ': ' + text + ' after ' + (Math.round(performance.now() - t0) - sentAt) + 'ms'); }
+    try {
+      if (transportName === 'xhr') {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.onload = function () { finish(xhr.status === 200 ? 'ok' : 'bad', 'status ' + xhr.status); };
+        xhr.onerror = function () { finish('bad', 'network error, status ' + xhr.status); };
+        xhr.send(envelope.body);
+      } else if (transportName === 'beacon') {
+        var queued = navigator.sendBeacon(url, envelope.body);
+        finish(queued ? 'ok' : 'bad', 'sendBeacon returned ' + queued + ' (queued is not delivered, read Sentry)');
+      } else {
+        window.fetch(url, { method: 'POST', body: envelope.body, keepalive: true, referrerPolicy: 'strict-origin' }).then(function (response) { finish(response.status === 200 ? 'ok' : 'bad', 'status ' + response.status); }, function (e) { finish('bad', 'rejected: ' + (e && e.message ? e.message : describe(e))); });
+      }
+    } catch (e) {
+      finish('bad', 'threw: ' + (e && e.message ? e.message : describe(e)));
+    }
+  }
+  // The lines above test the container primitives and not the SDK. This loads the official browser bundle with debug on, starts it with the same DSN, and lets the SDK print its own reason through the console mirror. The debug bundle keeps the messages the production bundle strips, such as the extension guard refusal and a discarded session.
+  var pageNonce = (document.currentScript && document.currentScript.nonce) || "";
+  function runRealSentrySdk() {
+    if (!sentry.key) { log("info", "real sdk: no sentryKey in the query, so the bundle is not loaded"); return; }
+    var script = document.createElement("script");
+    script.src = "https://browser.sentry-cdn.com/9.14.0/bundle.debug.min.js";
+    script.crossOrigin = "anonymous";
+    if (pageNonce) { script.nonce = pageNonce; script.setAttribute("nonce", pageNonce); }
+    var startedAt = Math.round(performance.now() - t0);
+    script.onload = function () {
+      log("ok", "real sdk: bundle loaded after " + (Math.round(performance.now() - t0) - startedAt) + "ms, typeof window.Sentry=" + typeof window.Sentry);
+      try {
+        window.Sentry.init({
+          dsn: "https://" + sentry.key + "@" + sentry.host + "/" + sentry.project,
+          release: "tng-bridge-check@2026.10.20",
+          environment: sentry.environment,
+          debug: true,
+          sendClientReports: false
+        });
+        var client = window.Sentry.getClient();
+        log(client ? "ok" : "bad", "real sdk: init returned, client " + (client ? "created, dsn host " + (client.getDsn() ? client.getDsn().host : "(none)") : "missing, so init refused to start"));
+        var eventId = window.Sentry.captureMessage("TnG bridge check page real SDK event", { level: "info", tags: { source: "tng-bridge-check", transport: "real-sdk", tngdJSBridgeType: typeof window.tngdJSBridge, alipayJSBridgeType: typeof window.AlipayJSBridge } });
+        log("info", "real sdk: captureMessage returned event id " + eventId);
+        setTimeout(function () {
+          window.Sentry.flush(2000).then(function (flushed) { log(flushed ? "ok" : "bad", "real sdk: flush resolved " + flushed + " (true means the transport queue drained)"); }, function (e) { log("bad", "real sdk: flush rejected: " + (e && e.message ? e.message : describe(e))); });
+        }, 1000);
+      } catch (e) {
+        log("bad", "real sdk: init threw: " + (e && e.message ? e.message : describe(e)));
+      }
+    };
+    script.onerror = function () { log("bad", "real sdk: the bundle failed to load from browser.sentry-cdn.com after " + (Math.round(performance.now() - t0) - startedAt) + "ms"); };
+    document.head.appendChild(script);
+    log("info", "real sdk: loading bundle.debug.min.js 9.14.0, the [Sentry] lines that follow come through the console mirror");
+  }
+  function runSentryTransportCheck() {
+    logSentryEnvironmentFacts();
+    checkSentryHost();
+    if (sentry.key && sentry.sdk) { setTimeout(runRealSentrySdk, 1500); }
+    if (!sentry.key) { log('info', 'sentry events: no sentryKey in the query, so no event is sent'); return; }
+    if (sentry.returned) { log('info', 'sentry events: the page returned from the navigate test, so the automatic events are skipped. Read Sentry for the event tagged transport=fetch-then-navigate.'); return; }
+    sendSentryEvent('fetch');
+    sendSentryEvent('xhr');
+    if (typeof navigator.sendBeacon === 'function') { sendSentryEvent('beacon'); } else { log('info', 'sentry event via beacon: navigator.sendBeacon is not a function'); }
+  }
+  document.getElementById('sentry-leave').addEventListener('click', function () {
+    if (!sentry.key) { log('bad', 'navigate test: no sentryKey in the query, so nothing is sent'); return; }
+    var next = new URL(location.href);
+    next.searchParams.set('sentryLeft', '1');
+    sendSentryEvent('fetch-then-navigate');
+    // The production page assigns location.href in the same tick as its log call, and the SDK sends with keepalive so that the request survives the navigation.
+    location.href = next.toString();
+  });
+
   var received = false;
   var answers = 0;
   var calls = 0;
@@ -609,6 +761,7 @@
       var report = refreshShapeReport();
       log('info', ms + 'ms shape report: bridges=' + (Object.keys(report.bridges).join(',') || '(none)') + ' answerTypes=' + Object.keys(report.answerTypes).length + ' messageHandlers=' + report.webkitMessageHandlers.length);
       if (ms === 1000 || ms === 10000) { logNewWindowNames(ms + 'ms check'); }
+      if (ms === 1000) { runSentryTransportCheck(); }
       if (ms === 10000 && !extraActionsCalled) { callExtraActions(window.tngdJSBridge ? 'tngdJSBridge' : 'AlipayJSBridge'); }
       if (ms === 3000 && !received) {
         callMyGetAuthCode('the 3 second check, without any ready event');
@@ -642,6 +795,36 @@
     } catch (e) { log('bad', 'share failed: ' + e.message); return; }
     log('bad', 'the share sheet is not available in this container, use the copy buttons');
   });
+  // The list on screen is the record, and a screenshot cuts it. These two buttons give the whole list as one text file, through the share sheet or the clipboard. An auth code and the Sentry key are redacted, because the file goes to another device.
+  function buildLogText() {
+    return Array.prototype.map.call(logEl.children, function (row) { return row.textContent; }).join('\n')
+      .replace(/("authCode":")[^"]*(")/g, '$1redacted$2')
+      .replace(/sentryKey=[0-9a-f]+/g, 'sentryKey=redacted') + '\n';
+  }
+  function fillLogText() {
+    var el = document.getElementById('log-text');
+    el.value = buildLogText();
+    return el.value;
+  }
+  function shareTextAsFile(text, name, label) {
+    try {
+      var file = new File([text], name, { type: 'text/plain' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        navigator.share({ files: [file], title: name }).then(function () { log('ok', 'shared ' + name); }, function (e) { log('bad', 'share refused: ' + e.message); });
+        return;
+      }
+      if (navigator.share) {
+        navigator.share({ text: text, title: name }).then(function () { log('ok', label + ' shared as text'); }, function (e) { log('bad', 'share refused: ' + e.message); });
+        return;
+      }
+    } catch (e) { log('bad', 'share failed: ' + e.message); return; }
+    log('bad', 'the share sheet is not available in this container, use the copy button');
+  }
+  document.getElementById('share-log').addEventListener('click', function () {
+    var name = 'bridge-check-log-' + new Date().toISOString().replace(/[:.]/g, '-') + '.txt';
+    shareTextAsFile(fillLogText(), name, 'the log');
+  });
+  document.getElementById('copy-log').addEventListener('click', function () { fillLogText(); copyFrom('log-text', 'the log'); });
   document.getElementById('refresh-shape').addEventListener('click', function () { refreshShapeReport(); log('info', 'shape report refreshed'); });
   refreshShapeReport();
 })();
