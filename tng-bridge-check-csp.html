@@ -27,7 +27,7 @@
 <h2>Shape report</h2>
 <p>The report has three parts, so that each part is small enough to paste on its own. Press Copy TypeScript draft first and send it alone. Then press Copy compact JSON and send it. Then press Copy function sources and send it last. The parts hold member names, types, function arity and function source. They hold no answer value and no URL. The TypeScript is a draft that needs review.</p>
 <p id="shape-sizes"></p>
-<p><button id="copy-ts" type="button">Copy TypeScript draft</button> <button id="copy-json" type="button">Copy compact JSON</button> <button id="copy-sources" type="button">Copy function sources</button> <button id="refresh-shape" type="button">Refresh</button></p>
+<p><button id="copy-ts" type="button">Copy TypeScript draft</button> <button id="copy-json" type="button">Copy compact JSON</button> <button id="copy-sources" type="button">Copy function sources</button> <button id="share-shape" type="button">Share all three as a file</button> <button id="refresh-shape" type="button">Refresh</button></p>
 <textarea id="shape-ts" readonly rows="8" style="width:100%;font:11px monospace" aria-label="Draft TypeScript interface"></textarea>
 <textarea id="shape-json" readonly rows="8" style="width:100%;font:11px monospace" aria-label="Compact shape report as JSON"></textarea>
 <textarea id="shape-sources" readonly rows="8" style="width:100%;font:11px monospace" aria-label="Function sources"></textarea>
@@ -170,6 +170,7 @@
     };
     var names = [];
     try { names = Object.getOwnPropertyNames(obj); } catch (e) { out.error = 'getOwnPropertyNames threw: ' + e.message; return out; }
+    var functionOwners = [];
     names.slice(0, MAX_MEMBERS).forEach(function (name) {
       var descriptor;
       try { descriptor = Object.getOwnPropertyDescriptor(obj, name); } catch (e) { out.members[name] = { error: 'descriptor threw: ' + e.message }; return; }
@@ -177,6 +178,11 @@
       if ('value' in descriptor) {
         entry.writable = descriptor.writable;
         entry.type = reflectValue(descriptor.value, depth + 1, seen);
+        // Two members that hold the very same function are aliases, which a copy of the source text cannot show.
+        if (typeof descriptor.value === 'function') {
+          var owner = functionOwners.filter(function (candidate) { return candidate.fn === descriptor.value; })[0];
+          if (owner) { entry.aliasOf = owner.name; } else { functionOwners.push({ fn: descriptor.value, name: name }); }
+        }
       } else {
         entry.accessor = { get: descriptor.get ? describeFunction(descriptor.get) : null, set: descriptor.set ? describeFunction(descriptor.set) : null };
       }
@@ -227,7 +233,7 @@
       if (m.error) { return pad + '  ' + id + ': unknown; // ' + m.error; }
       if (m.accessor) { return pad + '  readonly ' + id + ': unknown; // accessor' + (m.accessor.set ? ' with a setter' : ''); }
       var note = m.enumerable ? '' : ' // not enumerable';
-      if (m.type.kind === 'function') { return pad + '  ' + id + '(' + tsParameters(m.type) + '): unknown;' + (m.type.isNative ? ' // native, parameter names unknown' : (m.type.parameterNames ? '' : ' // parameter names not parsed')) + note; }
+      if (m.type.kind === 'function') { return pad + '  ' + id + '(' + tsParameters(m.type) + '): unknown;' + (m.aliasOf ? ' // the same function as ' + m.aliasOf : '') + (m.type.isNative ? ' // native, parameter names unknown' : (m.type.parameterNames ? '' : ' // parameter names not parsed')) + note; }
       return pad + '  ' + (m.writable ? '' : 'readonly ') + id + ': ' + tsFromReflection(m.type, indent + 1) + ';' + note;
     });
     return '{\n' + lines.join('\n') + '\n' + pad + '}';
@@ -594,6 +600,24 @@
   document.getElementById('copy-json').addEventListener('click', function () { copyFrom('shape-json', 'compact JSON'); });
   document.getElementById('copy-sources').addEventListener('click', function () { copyFrom('shape-sources', 'function sources'); });
   document.getElementById('copy-ts').addEventListener('click', function () { copyFrom('shape-ts', 'TypeScript draft'); });
+  // A large report can be cut when it is pasted into a chat. The share sheet sends it as a file instead, to AirDrop, Files or Notes, where it stays whole.
+  document.getElementById('share-shape').addEventListener('click', function () {
+    var report = refreshShapeReport();
+    var text = '=== TypeScript draft ===\n' + document.getElementById('shape-ts').value + '\n\n=== Compact JSON ===\n' + document.getElementById('shape-json').value + '\n\n=== Function sources ===\n' + document.getElementById('shape-sources').value + '\n';
+    var name = 'bridge-shape-' + Object.keys(report.bridges).join('-') + '.txt';
+    try {
+      var file = new File([text], name, { type: 'text/plain' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        navigator.share({ files: [file], title: name }).then(function () { log('ok', 'shared ' + name); }, function (e) { log('bad', 'share refused: ' + e.message); });
+        return;
+      }
+      if (navigator.share) {
+        navigator.share({ text: text, title: name }).then(function () { log('ok', 'shared as text'); }, function (e) { log('bad', 'share refused: ' + e.message); });
+        return;
+      }
+    } catch (e) { log('bad', 'share failed: ' + e.message); return; }
+    log('bad', 'the share sheet is not available in this container, use the copy buttons');
+  });
   document.getElementById('refresh-shape').addEventListener('click', function () { refreshShapeReport(); log('info', 'shape report refreshed'); });
   refreshShapeReport();
 })();
