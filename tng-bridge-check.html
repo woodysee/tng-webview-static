@@ -13,13 +13,15 @@
 </head>
 <body>
 <h1>TnG bridge check (no CSP)</h1>
-<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then press Copy JSON and Copy TypeScript draft under the list and send both, or screenshot the whole list. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none).</p>
+<p>Open this page from the TnG app entry point under test. Everything the page learns is printed below, so no debugger is needed. Wait 30 seconds, then press the three copy buttons under the list, one part per message, or screenshot the whole list. Query parameters: clientId, redirectUrl, scopes (comma separated), mode (immediate, afterFinish or both) and extraActions (comma separated read-only actions to call after the auth code answer, default getSystemInfo, or none).</p>
 <div id="log"></div>
 <h2>Shape report</h2>
-<p>The report holds member names, types, function arity and function source of each bridge object found, and the inferred type of each answer. It holds no answer value. Press a button, then paste the text into the ticket cache. The JSON is for comparing runs. The TypeScript is a draft interface that needs review.</p>
-<p><button id="copy-json" type="button">Copy JSON</button> <button id="copy-ts" type="button">Copy TypeScript draft</button> <button id="refresh-shape" type="button">Refresh</button></p>
-<textarea id="shape-json" readonly rows="10" style="width:100%;font:11px monospace" aria-label="Shape report as JSON"></textarea>
-<textarea id="shape-ts" readonly rows="10" style="width:100%;font:11px monospace" aria-label="Draft TypeScript interface"></textarea>
+<p>The report has three parts, so that each part is small enough to paste on its own. Press Copy TypeScript draft first and send it alone. Then press Copy compact JSON and send it. Then press Copy function sources and send it last. The parts hold member names, types, function arity and function source. They hold no answer value and no URL. The TypeScript is a draft that needs review.</p>
+<p id="shape-sizes"></p>
+<p><button id="copy-ts" type="button">Copy TypeScript draft</button> <button id="copy-json" type="button">Copy compact JSON</button> <button id="copy-sources" type="button">Copy function sources</button> <button id="refresh-shape" type="button">Refresh</button></p>
+<textarea id="shape-ts" readonly rows="8" style="width:100%;font:11px monospace" aria-label="Draft TypeScript interface"></textarea>
+<textarea id="shape-json" readonly rows="8" style="width:100%;font:11px monospace" aria-label="Compact shape report as JSON"></textarea>
+<textarea id="shape-sources" readonly rows="8" style="width:100%;font:11px monospace" aria-label="Function sources"></textarea>
 <script>
 (function () {
   var t0 = performance.now();
@@ -138,7 +140,11 @@
     if (value === null) { return { kind: 'null' }; }
     if (type === 'undefined') { return { kind: 'undefined' }; }
     if (type === 'function') { return describeFunction(value); }
-    if (type === 'string') { return { kind: 'string', value: value.length > 200 ? value.slice(0, 200) + '...' : value }; }
+    if (type === 'string') {
+      // A short plain string such as an environment name stays. A URL, a long string, a uuid or a long number is replaced by its length, because a launch URL holds the client id and the auth state.
+      var isIdentifying = value.length > 32 || /:\/\/|\d{8,}|[0-9a-f]{8}-[0-9a-f]{4}/i.test(value);
+      return isIdentifying ? { kind: 'string', redacted: true, length: value.length } : { kind: 'string', value: value };
+    }
     if (type === 'number' || type === 'boolean') { return { kind: type, value: value }; }
     if (type !== 'object') { return { kind: type, value: String(value) }; }
     if (seen.indexOf(value) !== -1) { return { kind: 'cycle' }; }
@@ -307,6 +313,20 @@
     });
     return report;
   }
+  // The JSON stays small enough to paste: each function source moves to a separate text, and the JSON keeps its length.
+  function stripSources(node, path, sources) {
+    if (!node || typeof node !== 'object') { return node; }
+    if (node.kind === 'function' && typeof node.source === 'string') {
+      sources[path] = node.source;
+      var copy = {};
+      Object.keys(node).forEach(function (k) { if (k !== 'source') { copy[k] = node[k]; } });
+      copy.sourceChars = node.source.length;
+      return copy;
+    }
+    var out = Array.isArray(node) ? [] : {};
+    Object.keys(node).forEach(function (k) { out[k] = stripSources(node[k], path ? path + '.' + k : k, sources); });
+    return out;
+  }
   function buildTypeScriptDraft(report) {
     var out = ['// Draft from observation on ' + report.userAgent, '// Review every member. A type here is what the container did at one moment, and unknown means no value was observed.', ''];
     Object.keys(report.bridges).forEach(function (name) {
@@ -325,8 +345,15 @@
     var report = buildShapeReport();
     var jsonEl = document.getElementById('shape-json');
     var tsEl = document.getElementById('shape-ts');
-    if (jsonEl) { jsonEl.value = JSON.stringify(report, null, 2); }
-    if (tsEl) { tsEl.value = buildTypeScriptDraft(report); }
+    var sourcesEl = document.getElementById('shape-sources');
+    var sources = {};
+    var compact = report;
+    try { compact = stripSources(report, '', sources); } catch (e) { log('bad', 'shape report could not strip sources: ' + e.message); }
+    try { if (jsonEl) { jsonEl.value = JSON.stringify(compact, null, 1); } } catch (e) { if (jsonEl) { jsonEl.value = 'JSON failed: ' + e.message; } log('bad', 'shape JSON failed: ' + e.message); }
+    try { if (tsEl) { tsEl.value = buildTypeScriptDraft(report); } } catch (e) { if (tsEl) { tsEl.value = 'TypeScript draft failed: ' + e.message; } log('bad', 'shape TypeScript draft failed: ' + e.message); }
+    if (sourcesEl) { sourcesEl.value = Object.keys(sources).map(function (path) { return '// ' + path + '\n' + sources[path]; }).join('\n\n'); }
+    var sizes = document.getElementById('shape-sizes');
+    if (sizes) { sizes.textContent = 'TypeScript ' + (tsEl ? tsEl.value.length : 0) + ' chars, JSON ' + (jsonEl ? jsonEl.value.length : 0) + ' chars, function sources ' + (sourcesEl ? sourcesEl.value.length : 0) + ' chars'; }
     return report;
   }
   function scheduleShapeRefresh() {
@@ -555,7 +582,8 @@
       }
     }, ms);
   });
-  document.getElementById('copy-json').addEventListener('click', function () { copyFrom('shape-json', 'JSON'); });
+  document.getElementById('copy-json').addEventListener('click', function () { copyFrom('shape-json', 'compact JSON'); });
+  document.getElementById('copy-sources').addEventListener('click', function () { copyFrom('shape-sources', 'function sources'); });
   document.getElementById('copy-ts').addEventListener('click', function () { copyFrom('shape-ts', 'TypeScript draft'); });
   document.getElementById('refresh-shape').addEventListener('click', function () { refreshShapeReport(); log('info', 'shape report refreshed'); });
   refreshShapeReport();
